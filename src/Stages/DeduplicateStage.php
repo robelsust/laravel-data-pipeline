@@ -5,17 +5,30 @@ declare(strict_types=1);
 namespace Robel\DataPipeline\Stages;
 
 use Closure;
+use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Laravel\SerializableClosure\SerializableClosure;
 use Robel\DataPipeline\Contracts\RecordStageInterface;
+use Robel\DataPipeline\Exceptions\PipelineBusyException;
+use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\RecordContext;
 
 final class DeduplicateStage implements RecordStageInterface
 {
     /**
-     * @var array<string, bool>
+     * @var array<string, array{owner: string, status: string, claimed_at?: float, committed_at?: float}>
      */
     private array $seen = [];
+
+    private ?string $runId = null;
+
+    private string $journalScope = '';
+
+    /** @var array<string, string> */
+    private array $durableClaims = [];
 
     private string|array|Closure $key;
 
@@ -30,7 +43,7 @@ final class DeduplicateStage implements RecordStageInterface
     private bool $chunkLocal;
 
     /**
-     * @var array<string, array{cache_key: ?string, hash: string, owner: string, index: int|string, identifier: ?string}>
+     * @var array<string, array{cache_key: ?string, hash: string, owner: string, index: int|string, identifier: ?string, token?: string}>
      */
     private array $pendingClaims = [];
 
@@ -50,6 +63,9 @@ final class DeduplicateStage implements RecordStageInterface
         int $maxKeys = 50000,
         bool $chunkLocal = false,
     ) {
+        if ($maxKeys < 1 || ! in_array($action, ['drop', 'error'], true)) {
+            throw new \InvalidArgumentException('Deduplication requires a positive key capacity and a drop or error action.');
+        }
         $this->key = $key;
         $this->action = $action;
         $this->store = $store;
@@ -115,6 +131,8 @@ final class DeduplicateStage implements RecordStageInterface
     {
         $this->seen = [];
         $this->pendingClaims = [];
+        $this->durableClaims = [];
+        $this->runId = null;
     }
 
     public function __clone(): void
@@ -133,6 +151,46 @@ final class DeduplicateStage implements RecordStageInterface
         return 'idx:'.((string) $record->index());
     }
 
+    public function prepareChunk(RecordChunk $chunk, ?string $runId, int $position): void
+    {
+        $this->runId = $runId;
+        $this->journalScope = hash('sha256', ($this->scope ?? 'default').':'.$position);
+        $this->durableClaims = [];
+        if ($runId === null || $this->chunkLocal) {
+            return;
+        }
+        $signatures = [];
+        foreach ($chunk->records() as $record) {
+            $signature = $this->computeSignature($record);
+            if ($signature !== null && $signature !== '') {
+                $signatures[] = hash('xxh128', $signature);
+            }
+        }
+        $this->durableClaims = DB::connection(config('data-pipeline.connection'))
+            ->table('pipeline_deduplication_claims')
+            ->where('pipeline_id', $runId)
+            ->where('scope', $this->journalScope)
+            ->whereIn('signature', array_unique($signatures))
+            ->pluck('record_owner', 'signature')->all();
+    }
+
+    /** Persist claim ownership in the same transaction as sink writes and checkpoints. */
+    public function recordDurableClaims(): void
+    {
+        if ($this->runId === null || $this->chunkLocal || $this->pendingClaims === []) {
+            return;
+        }
+        $rows = [];
+        foreach ($this->pendingClaims as $hash => $claim) {
+            if (! isset($this->durableClaims[$hash])) {
+                $rows[] = ['pipeline_id' => $this->runId, 'scope' => $this->journalScope, 'signature' => $hash, 'record_owner' => $claim['owner']];
+            }
+        }
+        if ($rows !== []) {
+            DB::connection(config('data-pipeline.connection'))->table('pipeline_deduplication_claims')->insert($rows);
+        }
+    }
+
     public function handleRecord(RecordContext $record): RecordContext
     {
         $signature = $this->computeSignature($record);
@@ -146,61 +204,48 @@ final class DeduplicateStage implements RecordStageInterface
 
         $isDuplicate = false;
 
-        if ($this->store !== null) {
-            $cacheKey = ($this->scope ?? 'pipeline:dedup:').$hash;
-            $existingClaim = Cache::store($this->store)->get($cacheKey) ?? ($this->seen[$hash] ?? null);
-
-            if ($existingClaim !== null) {
-                $existingOwner = is_array($existingClaim)
-                    ? ($existingClaim['owner'] ?? null)
-                    : (is_string($existingClaim) ? $existingClaim : null);
-
-                if ($existingOwner !== null && (string) $existingOwner === (string) $recordOwner) {
-                    $isDuplicate = false;
-                    if (! $record->isPreview() && ! $record->isDryRun()) {
-                        $this->pendingClaims[$hash] = [
-                            'cache_key' => $cacheKey,
-                            'hash' => $hash,
-                            'owner' => $recordOwner,
-                            'index' => $record->index(),
-                            'identifier' => $record->identifier(),
-                        ];
-                    }
-                } else {
-                    $isDuplicate = true;
+        if (isset($this->durableClaims[$hash])) {
+            $isDuplicate = $this->durableClaims[$hash] !== $recordOwner;
+        } elseif ($this->store !== null) {
+            $cacheKey = $this->cacheKey($hash);
+            if ($record->isPreview() || $record->isDryRun()) {
+                $existing = Cache::store($this->store)->get($cacheKey) ?? ($this->seen[$hash] ?? null);
+                $isDuplicate = $existing !== null && ($existing['owner'] ?? null) !== $recordOwner;
+                if ($existing === null) {
+                    $this->remember($hash, ['owner' => $recordOwner, 'status' => 'pending']);
                 }
             } else {
-                $claimData = [
-                    'owner' => $recordOwner,
-                    'status' => 'pending',
-                    'claimed_at' => microtime(true),
-                ];
-
-                if (! $record->isPreview() && ! $record->isDryRun()) {
-                    Cache::store($this->store)->put($cacheKey, $claimData, 86400);
-
-                    $this->pendingClaims[$hash] = [
-                        'cache_key' => $cacheKey,
-                        'hash' => $hash,
-                        'owner' => $recordOwner,
-                        'index' => $record->index(),
-                        'identifier' => $record->identifier(),
-                    ];
-                } else {
-                    if (count($this->seen) >= $this->maxKeys) {
-                        $this->seen = array_slice($this->seen, (int) ($this->maxKeys * 0.2), null, true);
+                $isDuplicate = $this->mutateClaim($cacheKey, function () use ($cacheKey, $hash, $recordOwner, $record): bool {
+                    $cache = Cache::store($this->store);
+                    $existing = $cache->get($cacheKey);
+                    if ($existing !== null && ($existing['token'] ?? null) === ($this->pendingClaims[$hash]['token'] ?? '')) {
+                        return ($existing['owner'] ?? null) !== $recordOwner;
                     }
-                    $this->seen[$hash] = $claimData;
-                }
+                    if ($existing !== null && ($existing['status'] ?? null) === 'committed' && $this->runId === null) {
+                        return ($existing['owner'] ?? null) !== $recordOwner;
+                    }
+                    if ($existing !== null && ($existing['status'] ?? null) === 'pending') {
+                        throw new PipelineBusyException('Deduplication key is owned by an active worker.');
+                    }
+                    if ($existing !== null) {
+                        $cache->forget($cacheKey);
+                    }
+                    $token = (string) Str::uuid();
+                    $data = ['owner' => $recordOwner, 'status' => 'pending', 'token' => $token];
+                    if (! $cache->add($cacheKey, $data, max(1, (int) config('data-pipeline.deduplication.pending_ttl', 120)))) {
+                        throw new PipelineBusyException('Deduplication claim changed while being acquired.');
+                    }
+                    $this->pendingClaims[$hash] = ['cache_key' => $cacheKey, 'hash' => $hash, 'owner' => $recordOwner, 'index' => $record->index(), 'identifier' => $record->identifier(), 'token' => $token];
+
+                    return false;
+                });
             }
         } else {
             if (isset($this->seen[$hash])) {
                 $existing = $this->seen[$hash];
-                $existingOwner = is_array($existing)
-                    ? ($existing['owner'] ?? null)
-                    : (is_string($existing) ? $existing : null);
+                $existingOwner = $existing['owner'];
 
-                if ($existingOwner !== null && (string) $existingOwner === (string) $recordOwner) {
+                if ($existingOwner === $recordOwner) {
                     $isDuplicate = false;
                     if (! $record->isPreview() && ! $record->isDryRun()) {
                         $this->pendingClaims[$hash] = [
@@ -216,7 +261,7 @@ final class DeduplicateStage implements RecordStageInterface
                 }
             } else {
                 if (count($this->seen) >= $this->maxKeys) {
-                    $this->seen = array_slice($this->seen, (int) ($this->maxKeys * 0.2), null, true);
+                    $this->seen = array_slice($this->seen, max(1, (int) ($this->maxKeys * 0.2)), null, true);
                 }
                 $this->seen[$hash] = [
                     'owner' => $recordOwner,
@@ -254,67 +299,67 @@ final class DeduplicateStage implements RecordStageInterface
      */
     public function commitClaims(): void
     {
-        if ($this->store !== null) {
-            foreach ($this->pendingClaims as $claim) {
-                if ($claim['cache_key'] !== null) {
-                    Cache::store($this->store)->put($claim['cache_key'], [
-                        'owner' => $claim['owner'],
-                        'status' => 'committed',
-                        'committed_at' => microtime(true),
-                    ], 86400);
-                }
-            }
-        } else {
-            foreach ($this->pendingClaims as $hash => $claim) {
-                if (isset($this->seen[$hash]) && is_array($this->seen[$hash])) {
-                    $this->seen[$hash]['status'] = 'committed';
-                    $this->seen[$hash]['committed_at'] = microtime(true);
-                }
+        foreach ($this->pendingClaims as $hash => $claim) {
+            if ($this->store !== null && $claim['cache_key'] !== null) {
+                $this->mutateClaim($claim['cache_key'], function () use ($claim): void {
+                    $cache = Cache::store($this->store);
+                    $existing = $cache->get($claim['cache_key']);
+                    if (($existing['token'] ?? null) === ($claim['token'] ?? null)) {
+                        $cache->put($claim['cache_key'], ['owner' => $claim['owner'], 'status' => 'committed', 'token' => $claim['token']], max(1, (int) config('data-pipeline.deduplication.committed_ttl', 86400)));
+                    }
+                });
+            } elseif (isset($this->seen[$hash])) {
+                $this->seen[$hash]['status'] = 'committed';
             }
         }
-
         $this->pendingClaims = [];
     }
 
-    /**
-     * Rollback pending uncommitted claims.
-     * If $failedIndicesOrIdentifiers is provided, rolls back only those records.
-     * Otherwise rolls back all pending uncommitted claims for this chunk.
-     *
-     * @param  array<int, int|string>|null  $failedIndicesOrIdentifiers
-     */
+    /** @param array<int, int|string>|null $failedIndicesOrIdentifiers */
     public function rollbackClaims(?array $failedIndicesOrIdentifiers = null): void
     {
-        if ($failedIndicesOrIdentifiers === null) {
-            foreach ($this->pendingClaims as $hash => $claim) {
-                if ($this->store !== null && $claim['cache_key'] !== null) {
-                    Cache::store($this->store)->forget($claim['cache_key']);
-                }
-                unset($this->seen[$hash]);
-            }
-            $this->pendingClaims = [];
-
-            return;
-        }
-
-        $filterMap = array_flip(array_map('strval', $failedIndicesOrIdentifiers));
-
+        $filter = $failedIndicesOrIdentifiers === null ? null : array_flip(array_map('strval', $failedIndicesOrIdentifiers));
         foreach ($this->pendingClaims as $hash => $claim) {
-            $idxMatch = isset($filterMap[(string) $claim['index']]);
-            $idMatch = $claim['identifier'] !== null && isset($filterMap[(string) $claim['identifier']]);
-
-            if ($idxMatch || $idMatch) {
-                if ($this->store !== null && $claim['cache_key'] !== null) {
-                    Cache::store($this->store)->forget($claim['cache_key']);
-                }
-                unset($this->seen[$hash]);
-                unset($this->pendingClaims[$hash]);
+            if ($filter !== null && ! isset($filter[(string) $claim['index']]) && ! isset($filter[(string) ($claim['identifier'] ?? '')])) {
+                continue;
             }
+            if ($this->store !== null && $claim['cache_key'] !== null) {
+                $this->mutateClaim($claim['cache_key'], function () use ($claim): void {
+                    $cache = Cache::store($this->store);
+                    if (($cache->get($claim['cache_key'])['token'] ?? null) === ($claim['token'] ?? null)) {
+                        $cache->forget($claim['cache_key']);
+                    }
+                });
+            }
+            unset($this->seen[$hash], $this->pendingClaims[$hash]);
+        }
+    }
+
+    /** @param array{owner: string, status: string} $claim */
+    private function remember(string $hash, array $claim): void
+    {
+        if (count($this->seen) >= $this->maxKeys) {
+            $this->seen = array_slice($this->seen, max(1, (int) ($this->maxKeys * 0.2)), null, true);
+        }
+        $this->seen[$hash] = $claim;
+    }
+
+    private function mutateClaim(string $key, Closure $callback): mixed
+    {
+        try {
+            $store = Cache::store($this->store)->getStore();
+            if (! $store instanceof LockProvider) {
+                throw new \LogicException('Distributed deduplication requires a cache store that supports atomic locks.');
+            }
+
+            return $store->lock($key.':mutation', 10)->block(5, $callback);
+        } catch (LockTimeoutException $exception) {
+            throw new PipelineBusyException('Deduplication claim lock is busy.', previous: $exception);
         }
     }
 
     /**
-     * @return array<string, array{cache_key: ?string, hash: string, owner: string, index: int|string, identifier: ?string}>
+     * @return array<string, array{cache_key: ?string, hash: string, owner: string, index: int|string, identifier: ?string, token?: string}>
      */
     public function getPendingClaims(): array
     {
@@ -329,7 +374,7 @@ final class DeduplicateStage implements RecordStageInterface
         }
 
         if ($this->store !== null) {
-            $cacheKey = ($this->scope ?? 'pipeline:dedup:').$hash;
+            $cacheKey = $this->cacheKey($hash);
 
             return Cache::store($this->store)->has($cacheKey) || isset($this->seen[$hash]);
         }
@@ -345,13 +390,13 @@ final class DeduplicateStage implements RecordStageInterface
         }
 
         if ($this->store !== null) {
-            $cacheKey = ($this->scope ?? 'pipeline:dedup:').$hash;
+            $cacheKey = $this->cacheKey($hash);
             $claim = Cache::store($this->store)->get($cacheKey) ?? ($this->seen[$hash] ?? null);
             if ($claim === null) {
                 return null;
             }
 
-            return is_array($claim) ? ($claim['owner'] ?? null) : (is_string($claim) ? $claim : null);
+            return $claim['owner'];
         }
 
         if (! isset($this->seen[$hash])) {
@@ -360,7 +405,7 @@ final class DeduplicateStage implements RecordStageInterface
 
         $claim = $this->seen[$hash];
 
-        return is_array($claim) ? ($claim['owner'] ?? null) : (is_string($claim) ? $claim : null);
+        return $claim['owner'];
     }
 
     public function releaseClaim(RecordContext|string $recordOrSignature): void
@@ -371,12 +416,25 @@ final class DeduplicateStage implements RecordStageInterface
         }
 
         if ($this->store !== null) {
-            $cacheKey = ($this->scope ?? 'pipeline:dedup:').$hash;
-            Cache::store($this->store)->forget($cacheKey);
+            $cacheKey = $this->cacheKey($hash);
+            $claim = $this->pendingClaims[$hash] ?? null;
+            if ($claim === null) {
+                return;
+            }
+            $this->mutateClaim($cacheKey, function () use ($cacheKey, $claim): void {
+                $cache = Cache::store($this->store);
+                if (($cache->get($cacheKey)['token'] ?? null) === ($claim['token'] ?? null)) {
+                    $cache->forget($cacheKey);
+                }
+            });
         }
 
-        unset($this->seen[$hash]);
-        unset($this->pendingClaims[$hash]);
+        unset($this->seen[$hash], $this->pendingClaims[$hash]);
+    }
+
+    private function cacheKey(string $hash): string
+    {
+        return ($this->scope ?? 'pipeline:dedup:').($this->runId !== null ? $this->runId.':'.$this->journalScope.':' : '').$hash;
     }
 
     private function resolveHash(RecordContext|string $recordOrSignature): ?string

@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Robel\DataPipeline\Validation;
 
+use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rules\Exists;
@@ -33,55 +35,32 @@ final class BatchValidator
         // 1. Separate database rules (unique, exists) from in-memory standard rules
         [$standardRules, $uniqueRules, $existsRules] = $this->extractDatabaseRules($this->rules);
 
-        // 2. Pre-fetch existing database values in a single query per rule
-        $existingUniqueValues = $this->fetchExistingValues($chunk, $uniqueRules, isUnique: true);
-        $existingExistsValues = $this->fetchExistingValues($chunk, $existsRules, isUnique: false);
+        $excludedByRecord = [];
+        $databaseFields = array_unique(array_merge(array_keys($uniqueRules), array_keys($existsRules)));
+        foreach ($chunk->records() as $record) {
+            if ($record->isDropped() || $standardRules === []) {
+                continue;
+            }
+            $validator = Validator::make($record->data(), $standardRules, $this->messages, $this->customAttributes);
+            if ($validator->fails()) {
+                $record->setErrors(array_merge($record->errors(), $validator->errors()->toArray()));
+            }
+            foreach ($databaseFields as $field) {
+                if (! Arr::has($validator->getData(), $field)) {
+                    $excludedByRecord[spl_object_id($record)][$field] = true;
+                }
+            }
+        }
 
-        // 3. Track duplicates seen within the current chunk
+        $existingUniqueValues = $this->fetchExistingValues($chunk, $uniqueRules, isUnique: true, excludedByRecord: $excludedByRecord);
+        $existingExistsValues = $this->fetchExistingValues($chunk, $existsRules, isUnique: false, excludedByRecord: $excludedByRecord);
         $seenInChunk = [];
 
-        // 4. Validate each record
         foreach ($chunk->records() as $record) {
             if ($record->isDropped()) {
                 continue;
             }
-
-            $excludedFields = [];
-
-            // Run standard Laravel in-memory validator
-            if (! empty($standardRules)) {
-                $validator = Validator::make(
-                    $record->data(),
-                    $standardRules,
-                    $this->messages,
-                    $this->customAttributes
-                );
-
-                if ($validator->fails()) {
-                    $record->setErrors(array_merge($record->errors(), $validator->errors()->toArray()));
-                }
-
-                $ref = new ReflectionClass($validator);
-                if ($ref->hasProperty('excludeAttributes')) {
-                    $prop = $ref->getProperty('excludeAttributes');
-                    $prop->setAccessible(true);
-                    $excludedFields = (array) $prop->getValue($validator);
-                }
-            }
-
-            $isFieldExcluded = function (string $field) use ($excludedFields): bool {
-                if (isset($excludedFields[$field])) {
-                    return true;
-                }
-
-                foreach ($excludedFields as $ex => $val) {
-                    if (fnmatch((string) $ex, $field) || fnmatch($field, (string) $ex)) {
-                        return true;
-                    }
-                }
-
-                return false;
-            };
+            $isFieldExcluded = fn (string $field): bool => isset($excludedByRecord[spl_object_id($record)][$field]);
 
             // Evaluate batched uniqueness
             foreach ($uniqueRules as $field => $uniqueConfig) {
@@ -178,7 +157,7 @@ final class BatchValidator
             foreach ($rulesList as $rule) {
                 if (is_string($rule) && str_starts_with($rule, 'unique:')) {
                     $params = explode(',', substr($rule, 7));
-                    $table = $params[0] ?? '';
+                    $table = $params[0];
                     $column = $params[1] ?? $field;
                     $ignore = isset($params[2]) && $params[2] !== 'NULL' && $params[2] !== '' ? $params[2] : null;
                     $idColumn = $params[3] ?? 'id';
@@ -232,7 +211,7 @@ final class BatchValidator
                     ];
                 } elseif (is_string($rule) && str_starts_with($rule, 'exists:')) {
                     $params = explode(',', substr($rule, 7));
-                    $table = $params[0] ?? '';
+                    $table = $params[0];
                     $column = $params[1] ?? $field;
 
                     $wheres = [];
@@ -292,7 +271,7 @@ final class BatchValidator
      * @param  array<string, array{table: string, column: string, ignore?: mixed, idColumn?: string, wheres?: array, using?: array}>  $dbRules
      * @return array<string, array<string, bool>>
      */
-    private function fetchExistingValues(RecordChunk $chunk, array $dbRules, bool $isUnique = false): array
+    private function fetchExistingValues(RecordChunk $chunk, array $dbRules, bool $isUnique = false, array $excludedByRecord = []): array
     {
         $existing = [];
 
@@ -307,6 +286,9 @@ final class BatchValidator
 
             $valuesInChunk = [];
             foreach ($chunk->records() as $record) {
+                if ($record->isDropped() || isset($excludedByRecord[spl_object_id($record)][$field])) {
+                    continue;
+                }
                 $val = $record->get($field);
                 if ($val !== null && $val !== '') {
                     if (is_array($val)) {
@@ -340,7 +322,7 @@ final class BatchValidator
                 : DB::table($table)->whereIn($column, $uniqueValues);
 
             // Apply ignore condition for unique rules
-            if ($isUnique && isset($config['ignore']) && $config['ignore'] !== null) {
+            if ($isUnique && isset($config['ignore'])) {
                 $ignoreVal = $config['ignore'];
                 $idCol = $config['idColumn'] ?? 'id';
                 if ($ignoreVal instanceof Model) {

@@ -26,7 +26,7 @@ final readonly class ArraySource implements SourceInterface
         }
     }
 
-    public function count(): ?int
+    public function count(): int
     {
         return count($this->items);
     }

@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Models\PipelineRun;
 use Robel\DataPipeline\Repositories\PipelineRepositoryInterface;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

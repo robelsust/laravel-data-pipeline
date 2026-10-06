@@ -66,10 +66,8 @@ class PipelineShowCommand extends Command
             $errorRows = [];
             foreach ($errors as $err) {
                 $errorMessages = [];
-                if (is_array($err->validation_errors)) {
-                    foreach ($err->validation_errors as $field => $msgs) {
-                        $errorMessages[] = "{$field}: ".implode(', ', (array) $msgs);
-                    }
+                foreach ($err->validation_errors ?? [] as $field => $msgs) {
+                    $errorMessages[] = "{$field}: ".implode(', ', $msgs);
                 }
 
                 $errorRows[] = [

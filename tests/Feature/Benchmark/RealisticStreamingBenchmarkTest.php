@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Results\SinkResult;
 use Robel\DataPipeline\Sinks\CustomSink;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\DB;
 
 uses(RefreshDatabase::class);
 

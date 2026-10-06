@@ -14,15 +14,13 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         php: [8.2, 8.3, 8.4]
-        laravel: [11.*, 12.*, 13.*]
+        laravel: [12.*, 13.*]
         stability: [prefer-stable]
         include:
-          - laravel: 11.*
-            testbench: 9.*
           - laravel: 12.*
             testbench: 10.*
           - laravel: 13.*
-            testbench: 10.*
+            testbench: 11.*
         exclude:
           - php: 8.2
             laravel: 13.*
@@ -52,3 +50,47 @@ jobs:
 
       - name: Execute tests
         run: vendor/bin/pest
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+      - run: composer install --prefer-dist --no-interaction --no-progress
+      - run: composer validate --strict
+      - run: composer analyse
+      - run: composer audit
+
+  concurrency:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pipeline_test
+          POSTGRES_USER: pipeline
+          POSTGRES_PASSWORD: pipeline-test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pcntl, posix, pdo_pgsql
+          coverage: none
+      - run: composer install --prefer-dist --no-interaction --no-progress
+      - run: vendor/bin/pest tests/Feature/RedisPostgresConcurrencyTest.php
+        env:
+          PIPELINE_INTEGRATION: '1'

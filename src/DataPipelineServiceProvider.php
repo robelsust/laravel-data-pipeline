@@ -26,41 +26,9 @@ final class DataPipelineServiceProvider extends ServiceProvider
             'data-pipeline'
         );
 
-        $this->app->bind(PipelineRepositoryInterface::class, function () {
-            $connection = config('data-pipeline.connection');
-
-            return new DatabasePipelineRepository($connection);
-        });
-
-        $this->app->singleton('data-pipeline', function () {
-            return new class
-            {
-                public function from(mixed $source): DataPipeline
-                {
-                    return DataPipeline::from($source);
-                }
-
-                public function register(string $name, \Closure|string $definition): void
-                {
-                    DataPipeline::register($name, $definition);
-                }
-
-                public function resolveDefinition(string $name): ?DataPipeline
-                {
-                    return DataPipeline::resolveDefinition($name);
-                }
-
-                public function resumeRun(string $runId, ?DataPipeline $pipeline = null): Results\PipelineResult
-                {
-                    return DataPipeline::resumeRun($runId, $pipeline);
-                }
-
-                public function retryFailedRecords(string $runId, ?DataPipeline $pipeline = null): array
-                {
-                    return DataPipeline::retryFailedRecords($runId, $pipeline);
-                }
-            };
-        });
+        $this->app->singleton(PipelineRepositoryInterface::class, DatabasePipelineRepository::class);
+        $this->app->singleton(PipelineManager::class);
+        $this->app->alias(PipelineManager::class, 'data-pipeline');
     }
 
     /**

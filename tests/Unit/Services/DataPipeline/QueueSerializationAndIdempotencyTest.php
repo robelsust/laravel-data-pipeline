@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineRun;
 use Robel\DataPipeline\Queue\ProcessPipelineChunkJob;
@@ -12,7 +12,7 @@ use Robel\DataPipeline\Stages\DeduplicateStage;
 use Robel\DataPipeline\Stages\FilterStage;
 use Robel\DataPipeline\Stages\ResolveRelationStage;
 use Robel\DataPipeline\Stages\TransformStage;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

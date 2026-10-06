@@ -2,15 +2,17 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Models\PipelineRun;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 
 it('executes pipeline:stress-test poison-pill scenario B and verifies quarantine and surgical recovery', function () {
     $this->artisan('pipeline:stress-test', [
+        '--table' => 'users',
+        '--allow-destructive' => true,
         'scenario' => 'poison-pill',
         '--records' => 400,
         '--chunk-size' => 50,
@@ -29,6 +31,8 @@ it('executes pipeline:stress-test poison-pill scenario B and verifies quarantine
 
 it('executes pipeline:stress-test crash-resume scenario C and verifies zero-duplicate recovery', function () {
     $this->artisan('pipeline:stress-test', [
+        '--table' => 'users',
+        '--allow-destructive' => true,
         'scenario' => 'crash-resume',
         '--records' => 100,
         '--chunk-size' => 20,

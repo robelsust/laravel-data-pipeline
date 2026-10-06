@@ -2,10 +2,13 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Contracts\Queue\Job;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Robel\DataPipeline\Contracts\SinkInterface;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Events\PipelineCompleted;
+use Robel\DataPipeline\Exceptions\PipelineBusyException;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Models\PipelineRun;
@@ -17,9 +20,7 @@ use Robel\DataPipeline\Results\RecordFailure;
 use Robel\DataPipeline\Results\SinkResult;
 use Robel\DataPipeline\Sinks\InsertSink;
 use Robel\DataPipeline\Stages\DeduplicateStage;
-use Illuminate\Contracts\Queue\Job;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Event;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 
@@ -312,7 +313,7 @@ it('protects against concurrent duplicate delivery of the same chunk across mult
     ]);
 
     // Worker 2 attempts to process concurrently while Worker 1 is in PROCESSING status
-    $job2->handle($repo);
+    expect(fn () => $job2->handle($repo))->toThrow(PipelineBusyException::class);
 
     // Assert Worker 2 bailed out: 0 records inserted, run counters remain 0
     expect(User::where('email', 'concurrent@test.com')->count())->toBe(0);
@@ -499,6 +500,7 @@ it('prevents retry attempt from reclaiming an active fresh PROCESSING lease held
     // Simulate queue worker attempt 2 while Worker 1 is still actively PROCESSING
     $mockQueueJob = Mockery::mock(Job::class);
     $mockQueueJob->shouldReceive('attempts')->andReturn(2);
+    $mockQueueJob->shouldReceive('release')->once()->with(5);
     $jobAttempt2->setJob($mockQueueJob);
 
     // Attempt 2 must NOT take the active lease

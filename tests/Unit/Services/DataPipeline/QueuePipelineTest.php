@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Bus\PendingBatch;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Bus;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Models\PipelineRun;
 use Robel\DataPipeline\Queue\ProcessPipelineChunkJob;
@@ -10,9 +12,7 @@ use Robel\DataPipeline\Repositories\PipelineRepositoryInterface;
 use Robel\DataPipeline\Sinks\InsertSink;
 use Robel\DataPipeline\Stages\TransformStage;
 use Robel\DataPipeline\Stages\ValidateStage;
-use Illuminate\Bus\PendingBatch;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Bus;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

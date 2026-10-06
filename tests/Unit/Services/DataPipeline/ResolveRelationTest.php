@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-use Robel\DataPipeline\DataPipeline;
-use Robel\DataPipeline\RecordChunk;
-use Robel\DataPipeline\RecordContext;
-use Robel\DataPipeline\Stages\ResolveRelationStage;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Robel\DataPipeline\DataPipeline;
+use Robel\DataPipeline\RecordChunk;
+use Robel\DataPipeline\RecordContext;
+use Robel\DataPipeline\Stages\ResolveRelationStage;
 
 uses(RefreshDatabase::class);
 

@@ -7,6 +7,7 @@ namespace Robel\DataPipeline\Sinks;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Robel\DataPipeline\Contracts\SinkInterface;
+use Robel\DataPipeline\Exceptions\PersistenceError;
 use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\Results\SinkResult;
 use Throwable;
@@ -97,16 +98,16 @@ final readonly class InsertSink implements SinkInterface
                 ? DB::connection($this->connection)->table($this->table)
                 : DB::table($this->table);
 
-            $query->insert($payloads);
+            $query->getConnection()->transaction(fn (): bool => $query->insert($payloads));
 
             return SinkResult::success(count($payloads));
         } catch (Throwable $e) {
             // Flag records in chunk with database error
             foreach ($chunk->valid() as $record) {
-                $record->addError('_db', $e->getMessage());
+                $record->addError('_db', PersistenceError::describe($e));
             }
 
-            return SinkResult::failure(count($payloads), ['exception' => $e->getMessage()]);
+            return SinkResult::failure(count($payloads), ['exception' => PersistenceError::describe($e)]);
         }
     }
 }

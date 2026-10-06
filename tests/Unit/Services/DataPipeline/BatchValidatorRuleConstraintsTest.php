@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
-use Robel\DataPipeline\RecordChunk;
-use Robel\DataPipeline\RecordContext;
-use Robel\DataPipeline\Validation\BatchValidator;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Validation\Rule;
+use Robel\DataPipeline\RecordChunk;
+use Robel\DataPipeline\RecordContext;
+use Robel\DataPipeline\Tests\Fixtures\User;
+use Robel\DataPipeline\Validation\BatchValidator;
 
 uses(RefreshDatabase::class);
 

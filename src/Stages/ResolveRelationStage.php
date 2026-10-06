@@ -34,7 +34,7 @@ final class ResolveRelationStage implements ChunkStageInterface
      * @param  string  $targetKey  The column on the target table to match against (e.g. 'name' or 'slug')
      * @param  string  $primaryKey  The column on the target table to retrieve (e.g. 'id')
      * @param  bool  $required  If true, records with unresolved values receive a validation error
-     * @param  (Closure(string): int|string|null)|null  $autoCreate  Optional closure to create missing relations on the fly
+     * @param  (Closure(string): (int|string|null))|null  $autoCreate  Optional closure to create missing relations on the fly
      */
     public function __construct(
         string $foreignKey,

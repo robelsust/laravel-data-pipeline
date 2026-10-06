@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\DB;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Models\PipelineRun;
+use Robel\DataPipeline\PipelineStatus;
 
 final class DatabasePipelineRepository implements PipelineRepositoryInterface
 {
@@ -20,7 +21,7 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
     ): PipelineRun {
         return PipelineRun::create([
             'name' => $name,
-            'status' => 'CREATED',
+            'status' => PipelineStatus::Created->value,
             'source_type' => $sourceType,
             'source_fingerprint' => $fingerprint,
             'total_records' => $totalRecords,
@@ -35,10 +36,10 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
         int $successfulIncrement,
         int $failedIncrement
     ): void {
-        DB::table('pipeline_runs')
+        DB::connection(config('data-pipeline.connection'))->table('pipeline_runs')
             ->where('id', $runId)
             ->update([
-                'status' => 'RUNNING',
+                'status' => PipelineStatus::Running->value,
                 'processed_records' => DB::raw("processed_records + {$processedIncrement}"),
                 'successful_records' => DB::raw("successful_records + {$successfulIncrement}"),
                 'failed_records' => DB::raw("failed_records + {$failedIncrement}"),
@@ -46,9 +47,9 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
             ]);
     }
 
-    public function markRunCompleted(string $runId, string $status = 'COMPLETED'): void
+    public function markRunCompleted(string $runId, string $status = PipelineStatus::Completed->value): void
     {
-        DB::table('pipeline_runs')
+        DB::connection(config('data-pipeline.connection'))->table('pipeline_runs')
             ->where('id', $runId)
             ->update([
                 'status' => $status,
@@ -60,13 +61,13 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
     public function markRunFailed(string $runId, string $errorMessage): void
     {
         $run = PipelineRun::find($runId);
-        $metadata = $run?->metadata ?? [];
+        $metadata = $run->metadata ?? [];
         $metadata['last_error'] = $errorMessage;
 
-        DB::table('pipeline_runs')
+        DB::connection(config('data-pipeline.connection'))->table('pipeline_runs')
             ->where('id', $runId)
             ->update([
-                'status' => 'FAILED',
+                'status' => PipelineStatus::Failed->value,
                 'metadata' => json_encode($metadata),
                 'completed_at' => now(),
                 'updated_at' => now(),
@@ -133,14 +134,14 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
                 'chunk_id' => $chunkId,
                 'record_index' => is_numeric($failure->index()) ? (int) $failure->index() : 0,
                 'record_identifier' => $failure->identifier(),
-                'raw_payload' => json_encode($raw),
-                'validation_errors' => json_encode($failure->errors()),
+                'raw_payload' => json_encode($raw, JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR),
+                'validation_errors' => json_encode($failure->errors(), JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR),
                 'exception_message' => $failure->exception(),
                 'failed_at' => $now,
             ];
         }
 
-        DB::table('pipeline_errors')->insert($records);
+        DB::connection(config('data-pipeline.connection'))->table('pipeline_errors')->insert($records);
     }
 
     public function reconcileChunkErrors(
@@ -149,7 +150,7 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
         array $failures,
         array $redactedAttributes = [],
     ): void {
-        $existingErrors = DB::table('pipeline_errors')
+        $existingErrors = DB::connection(config('data-pipeline.connection'))->table('pipeline_errors')
             ->where('pipeline_id', $runId)
             ->where('chunk_id', $chunkId)
             ->get();
@@ -179,32 +180,28 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
                 $matchedFailure = $currentFailuresByIndex[(int) $existing->record_index];
             }
 
-            if ($isStillFailing) {
+            if ($matchedFailure !== null) {
                 $preservedExistingIds[] = $existing->id;
 
                 $updateData = [];
-                if ($matchedFailure !== null) {
-                    $raw = $matchedFailure->rawInput();
-                    if (! empty($redactedAttributes)) {
-                        foreach ($redactedAttributes as $redactField) {
-                            if (array_key_exists($redactField, $raw)) {
-                                $raw[$redactField] = '[REDACTED]';
-                            }
+                $raw = $matchedFailure->rawInput();
+                if (! empty($redactedAttributes)) {
+                    foreach ($redactedAttributes as $redactField) {
+                        if (array_key_exists($redactField, $raw)) {
+                            $raw[$redactField] = '[REDACTED]';
                         }
                     }
-                    $updateData['raw_payload'] = json_encode($raw);
-                    $updateData['validation_errors'] = json_encode($matchedFailure->errors());
-                    if ($matchedFailure->exception() !== null) {
-                        $updateData['exception_message'] = $matchedFailure->exception();
-                    }
                 }
-                if (! empty($updateData)) {
-                    DB::table('pipeline_errors')
-                        ->where('id', $existing->id)
-                        ->update($updateData);
+                $updateData['raw_payload'] = json_encode($raw, JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+                $updateData['validation_errors'] = json_encode($matchedFailure->errors(), JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+                if ($matchedFailure->exception() !== null) {
+                    $updateData['exception_message'] = $matchedFailure->exception();
                 }
+                DB::connection(config('data-pipeline.connection'))->table('pipeline_errors')
+                    ->where('id', $existing->id)
+                    ->update($updateData);
             } else {
-                DB::table('pipeline_errors')
+                DB::connection(config('data-pipeline.connection'))->table('pipeline_errors')
                     ->where('id', $existing->id)
                     ->delete();
             }
@@ -246,8 +243,8 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
                     'chunk_id' => $chunkId,
                     'record_index' => $idx,
                     'record_identifier' => $ident,
-                    'raw_payload' => json_encode($raw),
-                    'validation_errors' => json_encode($failure->errors()),
+                    'raw_payload' => json_encode($raw, JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR),
+                    'validation_errors' => json_encode($failure->errors(), JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR),
                     'exception_message' => $failure->exception(),
                     'failed_at' => $now,
                 ];
@@ -255,7 +252,7 @@ final class DatabasePipelineRepository implements PipelineRepositoryInterface
         }
 
         if (! empty($newRecords)) {
-            DB::table('pipeline_errors')->insert($newRecords);
+            DB::connection(config('data-pipeline.connection'))->table('pipeline_errors')->insert($newRecords);
         }
     }
 

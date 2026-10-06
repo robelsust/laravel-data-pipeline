@@ -25,14 +25,16 @@ use Robel\DataPipeline\Contracts\SourceInterface;
 use Robel\DataPipeline\Events\PipelineChunkCompleted;
 use Robel\DataPipeline\Events\PipelineCompleted;
 use Robel\DataPipeline\Events\PipelineFailed;
-use Robel\DataPipeline\Events\PipelineRecordFailed;
 use Robel\DataPipeline\Events\PipelineStarted;
+use Robel\DataPipeline\Exceptions\PersistenceError;
+use Robel\DataPipeline\Exceptions\PipelineBusyException;
 use Robel\DataPipeline\Exceptions\PipelineValidationException;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Models\PipelineRun;
 use Robel\DataPipeline\Queue\ProcessPipelineChunkJob;
 use Robel\DataPipeline\Repositories\PipelineRepositoryInterface;
+use Robel\DataPipeline\Results\ChunkExecutionResult;
 use Robel\DataPipeline\Results\PipelineResult;
 use Robel\DataPipeline\Results\RecordErrorBag;
 use Robel\DataPipeline\Results\RecordFailure;
@@ -45,12 +47,14 @@ use Robel\DataPipeline\Sources\LazySource;
 use Robel\DataPipeline\Stages\DeduplicateStage;
 use Robel\DataPipeline\Stages\FilterStage;
 use Robel\DataPipeline\Stages\MapFieldsStage;
+use Robel\DataPipeline\Stages\RejectRedactedPayloadStage;
 use Robel\DataPipeline\Stages\ResolveRelationStage;
 use Robel\DataPipeline\Stages\TransformStage;
 use Robel\DataPipeline\Stages\ValidateStage;
 use Throwable;
 use Traversable;
 
+/** @phpstan-consistent-constructor */
 class DataPipeline
 {
     /**
@@ -95,6 +99,10 @@ class DataPipeline
     public function __construct(mixed $source)
     {
         $this->source = $this->resolveSource($source);
+        $this->chunkSize = max(1, (int) config('data-pipeline.default_chunk_size', 500));
+        $this->redactedAttributes = config('data-pipeline.redacted_attributes', []);
+        $this->queueName = config('data-pipeline.queue.name', 'default');
+        $this->connectionName = config('data-pipeline.queue.connection');
     }
 
     public static function register(string $name, Closure|string $definition): void
@@ -109,7 +117,7 @@ class DataPipeline
             if ($def instanceof Closure) {
                 return $def();
             }
-            if (is_string($def) && class_exists($def)) {
+            if (class_exists($def)) {
                 return app($def)->pipeline();
             }
         }
@@ -570,7 +578,7 @@ class DataPipeline
             if ($repository !== null && $this->runId !== null) {
                 $repository->markRunCompleted(
                     runId: $this->runId,
-                    status: $failed > 0 ? 'PARTIAL_SUCCESS' : 'COMPLETED'
+                    status: $failed > 0 ? PipelineStatus::PartialSuccess->value : PipelineStatus::Completed->value
                 );
             }
 
@@ -598,7 +606,7 @@ class DataPipeline
             return $result;
         } catch (Throwable $e) {
             if ($repository !== null && $this->runId !== null) {
-                $repository->markRunFailed($this->runId, $e->getMessage());
+                $repository->markRunFailed($this->runId, PersistenceError::describe($e));
             }
 
             if (! ($e instanceof PipelineValidationException)) {
@@ -681,13 +689,13 @@ class DataPipeline
                     return;
                 }
 
-                $status = $hasFailures ? 'PARTIAL_SUCCESS' : 'COMPLETED';
+                $status = $hasFailures ? PipelineStatus::PartialSuccess->value : PipelineStatus::Completed->value;
                 $repo->markRunCompleted($runId, $status);
 
                 PipelineCompleted::dispatch($runId, new PipelineResult(
-                    totalProcessed: $runModel?->processed_records ?? 0,
-                    successful: $runModel?->successful_records ?? 0,
-                    failed: $runModel?->failed_records ?? 0,
+                    totalProcessed: $runModel->processed_records ?? 0,
+                    successful: $runModel->successful_records ?? 0,
+                    failed: $runModel->failed_records ?? 0,
                     errors: new RecordErrorBag,
                     durationInSeconds: 0.0,
                     metadata: ['batch_id' => $batch->id],
@@ -695,7 +703,7 @@ class DataPipeline
             })
             ->catch(function (Batch $batch, Throwable $e) use ($runId) {
                 $repo = app(PipelineRepositoryInterface::class);
-                $repo->markRunFailed($runId, $e->getMessage());
+                $repo->markRunFailed($runId, PersistenceError::describe($e));
 
                 PipelineFailed::dispatch($runId, $e);
             });
@@ -810,14 +818,18 @@ class DataPipeline
             );
         }
 
+        $leaseSeconds = max((int) config('data-pipeline.queue.timeout', 60) + 30, (int) config('data-pipeline.queue.lease_seconds', 90));
+        if (PipelineChunk::where('pipeline_id', $runId)->where('status', PipelineStatus::Processing->value)
+            ->where('started_at', '>', now()->subSeconds($leaseSeconds))->exists()) {
+            throw new PipelineBusyException('Cannot resume a pipeline while a worker owns an active chunk lease. Stop its workers and retry after the lease expires.');
+        }
         $pipeline->runId = $runId;
         $repository = app(PipelineRepositoryInterface::class);
         $resumeStages = $pipeline->freshStages();
 
         // Chunks already committed to sink with successful writes
         $committedChunks = PipelineChunk::where('pipeline_id', $runId)
-            ->whereIn('status', ['COMPLETED', 'PARTIAL'])
-            ->where('successful_count', '>', 0)
+            ->whereIn('status', [PipelineStatus::Completed->value, PipelineStatus::Partial->value])
             ->get();
 
         $committedSequences = $committedChunks->pluck('sequence')->flip()->all();
@@ -827,7 +839,7 @@ class DataPipeline
         $baselineFailed = (int) $committedChunks->sum('failed_count');
 
         $run->update([
-            'status' => 'RUNNING',
+            'status' => PipelineStatus::Running->value,
             'processed_records' => $baselineProcessed,
             'successful_records' => $baselineSuccessful,
             'failed_records' => $baselineFailed,
@@ -882,18 +894,18 @@ class DataPipeline
 
         $freshRun = PipelineRun::find($runId);
         $remainingErrorsCount = PipelineError::where('pipeline_id', $runId)->count();
-        $finalFailed = $freshRun?->failed_records ?? $failed;
+        $finalFailed = $freshRun->failed_records ?? $failed;
         if ($remainingErrorsCount === 0 && $finalFailed > 0) {
             $finalFailed = 0;
             $freshRun?->update(['failed_records' => 0]);
         }
-        $finalStatus = ($finalFailed > 0 || $remainingErrorsCount > 0) ? 'PARTIAL_SUCCESS' : 'COMPLETED';
+        $finalStatus = ($finalFailed > 0 || $remainingErrorsCount > 0) ? PipelineStatus::PartialSuccess->value : PipelineStatus::Completed->value;
         $repository->markRunCompleted($runId, $finalStatus);
 
         $duration = microtime(true) - $startTime;
         $result = new PipelineResult(
-            totalProcessed: $freshRun?->processed_records ?? $totalProcessed,
-            successful: $freshRun?->successful_records ?? $successful,
+            totalProcessed: $freshRun->processed_records ?? $totalProcessed,
+            successful: $freshRun->successful_records ?? $successful,
             failed: $finalFailed,
             errors: $errorBag,
             durationInSeconds: round($duration, 4),
@@ -928,210 +940,65 @@ class DataPipeline
         }
 
         $pipeline->runId = $runId;
-        $hasErrors = PipelineError::where('pipeline_id', $runId)->exists();
-
-        if (! $hasErrors) {
-            return [
-                'retried' => 0,
-                'recovered' => 0,
-                'remaining_failed' => 0,
-            ];
-        }
-
-        $totalRetried = 0;
-        $recoveredCount = 0;
-        $stillFailedCount = 0;
-
-        PipelineError::where('pipeline_id', $runId)
-            ->orderBy('id')
-            ->chunkById($pipeline->chunkSize, function ($errorBatch) use (
-                $pipeline,
-                &$totalRetried,
-                &$recoveredCount,
-                &$stillFailedCount
-            ) {
-                $totalRetried += $errorBatch->count();
-                $contexts = [];
-                $errorModelMap = [];
-
-                foreach ($errorBatch as $errorRecord) {
-                    $ctx = RecordContext::fromRaw($errorRecord->raw_payload, $errorRecord->record_index);
-                    if ($errorRecord->record_identifier !== null) {
-                        $ctx->setIdentifier($errorRecord->record_identifier);
+        $retried = 0;
+        $recovered = 0;
+        $repository = app(PipelineRepositoryInterface::class);
+        $connection = DB::connection(config('data-pipeline.connection'));
+        PipelineError::where('pipeline_id', $runId)->orderBy('id')->chunkById($pipeline->chunkSize, function ($errors) use ($pipeline, $runId, $repository, $connection, &$retried, &$recovered): void {
+            $stages = $pipeline->freshStages();
+            $stages[] = new RejectRedactedPayloadStage;
+            $retried += $errors->count();
+            try {
+                $count = $connection->transaction(function () use ($errors, $pipeline, $runId, $repository, $stages): int {
+                    $locked = PipelineError::whereIn('id', $errors->modelKeys())->lockForUpdate()->get();
+                    if ($locked->isEmpty()) {
+                        return 0;
                     }
-                    $contexts[] = $ctx;
-                    $errorModelMap[$errorRecord->record_index] = $errorRecord;
-                }
-
-                $chunk = new RecordChunk($contexts, 1);
-                $retryStages = $pipeline->freshStages();
-                $processed = $pipeline->executeStagesOnChunk($chunk, $retryStages);
-
-                $validForSink = [];
-
-                foreach ($processed->records() as $rec) {
-                    $errorRecord = $errorModelMap[$rec->index()] ?? null;
-                    if (! $errorRecord) {
-                        continue;
+                    $records = [];
+                    foreach ($locked as $error) {
+                        $records[] = RecordContext::fromRaw($error->raw_payload, $error->record_index, $error->record_identifier);
                     }
-
-                    if ($rec->isInvalid() || $rec->isDropped()) {
-                        $errorRecord->update([
-                            'validation_errors' => $rec->errors(),
-                            'failed_at' => now(),
-                        ]);
-                        $stillFailedCount++;
-                    } else {
-                        $validForSink[] = $rec;
-                    }
-                }
-
-                if (! empty($validForSink)) {
-                    $recoveredChunk = new RecordChunk($validForSink, 1);
-
-                    if ($pipeline->sink !== null) {
-                        try {
-                            $sinkResult = $pipeline->sink->persist($recoveredChunk);
-                        } catch (Throwable $e) {
-                            $sinkResult = SinkResult::failure(
-                                count($recoveredChunk->records()),
-                                ['exception' => $e->getMessage()]
-                            );
-                        }
-
-                        // Inspect sinkResult: if sink persisted zero records, preserve quarantine
-                        if ($sinkResult->persistedCount === 0) {
-                            foreach ($retryStages as $stage) {
-                                if ($stage instanceof DeduplicateStage) {
-                                    $stage->rollbackClaims();
-                                }
-                            }
-
-                            $errorMessage = $sinkResult->metadata['exception']
-                                ?? ($sinkResult->metadata['error'] ?? 'Sink persistence failed.');
-
-                            foreach ($recoveredChunk->records() as $rec) {
-                                $errorRecord = $errorModelMap[$rec->index()] ?? null;
-                                if ($errorRecord) {
-                                    $rec->addError('_sink', $errorMessage);
-                                    $errorRecord->update([
-                                        'validation_errors' => $rec->errors(),
-                                        'exception_message' => $errorMessage,
-                                        'failed_at' => now(),
-                                    ]);
-                                    $stillFailedCount++;
-                                }
-                            }
-                        } else {
-                            $totalChunkCount = count($recoveredChunk->records());
-                            $allPersisted = ($sinkResult->persistedCount >= $totalChunkCount && $sinkResult->failedCount === 0);
-
-                            // Extract positive and negative row-level attributions
-                            $persistedIndices = array_flip(
-                                ! empty($sinkResult->persistedIndices)
-                                    ? $sinkResult->persistedIndices
-                                    : ($sinkResult->metadata['persisted_indices'] ?? [])
-                            );
-                            $failedIndices = array_flip(
-                                ! empty($sinkResult->failedIndices)
-                                    ? $sinkResult->failedIndices
-                                    : ($sinkResult->metadata['failed_indices'] ?? [])
-                            );
-
-                            $hasExplicitAttribution = ! empty($persistedIndices) || ! empty($failedIndices);
-
-                            foreach ($recoveredChunk->records() as $rec) {
-                                $errorRecord = $errorModelMap[$rec->index()] ?? null;
-                                if (! $errorRecord) {
+                    $recoveredInChunk = 0;
+                    app(ChunkExecutor::class)->execute(
+                        new RecordChunk($records), $stages, $pipeline->sink, $repository, $runId,
+                        transactional: $pipeline->transactional,
+                        allowCrossConnectionTransactions: $pipeline->allowCrossConnectionTransactions,
+                        redactedAttributes: $pipeline->redactedAttributes,
+                        recordCheckpoint: false,
+                        afterPersistence: function (ChunkExecutionResult $result) use ($locked, $runId, &$recoveredInChunk): void {
+                            $byIndex = $locked->keyBy('record_index');
+                            foreach ($result->chunk->records() as $record) {
+                                $error = $byIndex->get($record->index());
+                                if ($error === null) {
                                     continue;
                                 }
-
-                                $index = $rec->index();
-                                $identifier = $rec->identifier();
-
-                                // 1. Determine if this record specifically failed
-                                $isExplicitlyFailed = $rec->isInvalid()
-                                    || isset($failedIndices[$index])
-                                    || ($identifier !== null && isset($failedIndices[$identifier]));
-
-                                // 2. Determine if this record specifically persisted
-                                $isExplicitlyPersisted = isset($persistedIndices[$index])
-                                    || ($identifier !== null && isset($persistedIndices[$identifier]));
-
-                                if ($isExplicitlyFailed) {
-                                    $errorRecord->update([
-                                        'validation_errors' => $rec->errors(),
-                                        'exception_message' => $sinkResult->metadata['error'] ?? 'Sink persistence failed for this record.',
-                                        'failed_at' => now(),
-                                    ]);
-                                    $stillFailedCount++;
-                                } elseif ($isExplicitlyPersisted || ($allPersisted && ! $rec->isInvalid())) {
-                                    // Confirmed persisted: delete from quarantine
-                                    $errorRecord->delete();
-                                    $recoveredCount++;
-                                } elseif ($hasExplicitAttribution && ! $isExplicitlyPersisted) {
-                                    // Other records were explicitly persisted, but this one was not
-                                    $errorRecord->update([
-                                        'exception_message' => 'Record not persisted by sink.',
-                                        'failed_at' => now(),
-                                    ]);
-                                    $stillFailedCount++;
+                                if ($record->isInvalid() || $record->isDropped()) {
+                                    $error->update(['validation_errors' => $record->errors(), 'exception_message' => $record->isDropped() ? 'Record dropped during retry.' : implode('; ', array_merge(...array_values($record->errors()))), 'failed_at' => now()]);
                                 } else {
-                                    // Partial result without row-level attribution: preserve in quarantine to prevent data loss
-                                    $errorRecord->update([
-                                        'exception_message' => "Ambiguous partial sink persistence ({$sinkResult->persistedCount}/{$totalChunkCount} persisted); retained in quarantine to protect payload.",
-                                        'failed_at' => now(),
-                                    ]);
-                                    $stillFailedCount++;
+                                    $error->delete();
+                                    $recoveredInChunk++;
                                 }
                             }
+                            PipelineRun::whereKey($runId)->increment('successful_records', $recoveredInChunk);
+                        },
+                    );
 
-                            if ($sinkResult->failedCount > 0) {
-                                $failedList = ! empty($sinkResult->failedIndices)
-                                    ? $sinkResult->failedIndices
-                                    : ($sinkResult->metadata['failed_indices'] ?? []);
-                                foreach ($retryStages as $stage) {
-                                    if ($stage instanceof DeduplicateStage) {
-                                        $stage->rollbackClaims($failedList);
-                                        $stage->commitClaims();
-                                    }
-                                }
-                            } else {
-                                foreach ($retryStages as $stage) {
-                                    if ($stage instanceof DeduplicateStage) {
-                                        $stage->commitClaims();
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        foreach ($validForSink as $rec) {
-                            $errorRecord = $errorModelMap[$rec->index()] ?? null;
-                            $errorRecord?->delete();
-                            $recoveredCount++;
-                        }
-                        foreach ($retryStages as $stage) {
-                            if ($stage instanceof DeduplicateStage) {
-                                $stage->commitClaims();
-                            }
-                        }
+                    return $recoveredInChunk;
+                });
+                $recovered += $count;
+            } catch (Throwable $exception) {
+                foreach ($stages as $stage) {
+                    if ($stage instanceof DeduplicateStage) {
+                        $stage->rollbackClaims();
                     }
                 }
-            });
+                PipelineError::whereIn('id', $errors->modelKeys())->update(['exception_message' => PersistenceError::describe($exception), 'failed_at' => now()]);
+            }
+        });
+        $remaining = PipelineError::where('pipeline_id', $runId)->count();
+        $run->update(['failed_records' => $remaining, 'status' => $remaining === 0 ? PipelineStatus::Completed->value : PipelineStatus::PartialSuccess->value, 'updated_at' => now()]);
 
-        $remainingFailed = PipelineError::where('pipeline_id', $runId)->count();
-        $run->update([
-            'successful_records' => $run->successful_records + $recoveredCount,
-            'failed_records' => $remainingFailed,
-            'status' => $remainingFailed === 0 ? 'COMPLETED' : 'PARTIAL_SUCCESS',
-            'updated_at' => now(),
-        ]);
-
-        return [
-            'retried' => $totalRetried,
-            'recovered' => $recoveredCount,
-            'remaining_failed' => $remainingFailed,
-        ];
+        return ['retried' => $retried, 'recovered' => $recovered, 'remaining_failed' => $remaining];
     }
 
     /**
@@ -1146,230 +1013,23 @@ class DataPipeline
         ?PipelineRepositoryInterface $repository = null,
         ?array $stages = null
     ): void {
-        $chunkStartTime = microtime(true);
-
-        $execute = function () use (
-            $chunk,
-            $stages,
-            $totalProcessed,
-            &$successful,
-            &$failed,
-            $errorBag,
-            $repository,
-            $chunkStartTime
-        ) {
-            $processedChunk = $this->executeStagesOnChunk($chunk, $stages);
-            $chunkFailures = [];
-
-            // Record invalid rows in error bag and dispatch PipelineRecordFailed
-            foreach ($processedChunk->invalid() as $invalidRecord) {
-                $failed++;
-                $failure = new RecordFailure(
-                    index: $invalidRecord->index(),
-                    identifier: $invalidRecord->identifier(),
-                    rawInput: $invalidRecord->raw(),
-                    errors: $invalidRecord->errors(),
-                );
-                $errorBag->add($failure);
-                $chunkFailures[] = $failure;
-
-                PipelineRecordFailed::dispatch($this->runId, $failure);
-            }
-
-            $chunkSuccessful = 0;
-            $chunkFailed = count($chunkFailures);
-
-            // Strict failure: failIfAny prevents sink writes for chunks containing failures
-            if (! $this->allowPartialSuccess && $chunkFailed > 0) {
-                // Do not persist this chunk to sink
-                foreach ($stages ?? $this->stages as $stage) {
-                    if ($stage instanceof DeduplicateStage) {
-                        $stage->rollbackClaims();
-                    }
-                }
-            } elseif ($this->sink !== null) {
-                try {
-                    $sinkResult = $this->sink->persist($processedChunk);
-                } catch (Throwable $sinkEx) {
-                    foreach ($stages ?? $this->stages as $stage) {
-                        if ($stage instanceof DeduplicateStage) {
-                            $stage->rollbackClaims();
-                        }
-                    }
-                    throw $sinkEx;
-                }
-
-                $successful += $sinkResult->persistedCount;
-                $chunkSuccessful += $sinkResult->persistedCount;
-
-                if ($sinkResult->persistedCount === 0 && $sinkResult->failedCount > 0) {
-                    foreach ($stages ?? $this->stages as $stage) {
-                        if ($stage instanceof DeduplicateStage) {
-                            $stage->rollbackClaims();
-                        }
-                    }
-                } elseif ($sinkResult->failedCount > 0) {
-                    $failedIndices = array_map(fn ($f) => $f->index(), $chunkFailures);
-                    foreach ($stages ?? $this->stages as $stage) {
-                        if ($stage instanceof DeduplicateStage) {
-                            $stage->rollbackClaims($failedIndices);
-                            $stage->commitClaims();
-                        }
-                    }
-                } else {
-                    foreach ($stages ?? $this->stages as $stage) {
-                        if ($stage instanceof DeduplicateStage) {
-                            $stage->commitClaims();
-                        }
-                    }
-                }
-
-                // If the sink failed some rows, capture them across ALL chunk records
-                if ($sinkResult->failedCount > 0) {
-                    $failed += $sinkResult->failedCount;
-                    $chunkFailed += $sinkResult->failedCount;
-                    $alreadyFailedIndices = array_flip(array_map(fn ($f) => $f->index(), $chunkFailures));
-
-                    foreach ($processedChunk->records() as $r) {
-                        if ($r->isInvalid() && ! isset($alreadyFailedIndices[$r->index()])) {
-                            $failure = new RecordFailure(
-                                index: $r->index(),
-                                identifier: $r->identifier(),
-                                rawInput: $r->raw(),
-                                errors: $r->errors(),
-                            );
-                            $errorBag->add($failure);
-                            $chunkFailures[] = $failure;
-                            $alreadyFailedIndices[$r->index()] = true;
-
-                            PipelineRecordFailed::dispatch($this->runId, $failure);
-                        }
-                    }
-
-                    if (count($chunkFailures) < $chunkFailed) {
-                        foreach ($processedChunk->records() as $r) {
-                            if (! isset($alreadyFailedIndices[$r->index()])) {
-                                $r->addError('_sink', $sinkResult->metadata['exception'] ?? ($sinkResult->metadata['error'] ?? 'Sink persistence failed.'));
-                                $failure = new RecordFailure(
-                                    index: $r->index(),
-                                    identifier: $r->identifier(),
-                                    rawInput: $r->raw(),
-                                    errors: $r->errors(),
-                                );
-                                $errorBag->add($failure);
-                                $chunkFailures[] = $failure;
-                                $alreadyFailedIndices[$r->index()] = true;
-
-                                PipelineRecordFailed::dispatch($this->runId, $failure);
-                            }
-                        }
-                    }
-                }
-            } else {
-                $validCount = count($processedChunk->valid());
-                $successful += $validCount;
-                $chunkSuccessful += $validCount;
-
-                foreach ($stages ?? $this->stages as $stage) {
-                    if ($stage instanceof DeduplicateStage) {
-                        $stage->commitClaims();
-                    }
-                }
-            }
-
-            // Persist chunk checkpoint and errors to database repository if tracking enabled
-            if ($repository !== null && $this->runId !== null) {
-                $records = $chunk->records();
-                $lastRecord = ! empty($records) ? $records[count($records) - 1] : null;
-                $lastOffset = $lastRecord && is_numeric($lastRecord->index()) ? (int) $lastRecord->index() : null;
-
-                $chunkStatus = match (true) {
-                    $chunkFailed === 0 => 'COMPLETED',
-                    $chunkSuccessful > 0 => 'PARTIAL',
-                    default => 'FAILED',
-                };
-
-                $chunkRecord = $repository->recordChunk(
-                    runId: $this->runId,
-                    sequence: $chunk->sequence(),
-                    status: $chunkStatus,
-                    recordsCount: $chunk->count(),
-                    successfulCount: $chunkSuccessful,
-                    failedCount: $chunkFailed,
-                    lastOffset: $lastOffset,
-                );
-
-                $repository->reconcileChunkErrors(
-                    runId: $this->runId,
-                    chunkId: $chunkRecord->id,
-                    failures: $chunkFailures,
-                    redactedAttributes: $this->redactedAttributes,
-                );
-
-                $repository->updateRunProgress(
-                    runId: $this->runId,
-                    processedIncrement: $chunk->count(),
-                    successfulIncrement: $chunkSuccessful,
-                    failedIncrement: $chunkFailed,
-                );
-            }
-
-            $chunkDuration = round(microtime(true) - $chunkStartTime, 4);
-
-            PipelineChunkCompleted::dispatch(
-                $this->runId,
-                $chunk->sequence(),
-                $chunk->count(),
-                $chunkSuccessful,
-                $chunkFailed,
-                $chunkDuration,
-            );
-
-            if ($this->progressCallback !== null) {
-                ($this->progressCallback)(
-                    $totalProcessed,
-                    $this->source->count(),
-                    $chunkSuccessful,
-                    $chunkFailed,
-                    $chunk,
-                );
-            }
-        };
-
-        $destConnection = ($this->sink !== null && method_exists($this->sink, 'getConnection'))
-            ? $this->sink->getConnection()
-            : null;
-        $trackingConnection = config('database.default');
-
+        $started = microtime(true);
+        $result = app(ChunkExecutor::class)->execute(
+            $chunk, $stages ?? $this->stages, $this->sink, $repository, $this->runId,
+            $this->allowPartialSuccess, $this->transactional, $this->allowCrossConnectionTransactions, $this->redactedAttributes,
+        );
+        $successful += $result->successful;
+        $failed += $result->failed();
+        foreach ($result->failures as $failure) {
+            $errorBag->add($failure);
+        }
         try {
-            if ($this->transactional && $this->sink !== null) {
-                if ($destConnection !== null && $destConnection !== $trackingConnection) {
-                    if (! $this->allowCrossConnectionTransactions) {
-                        throw new \LogicException(
-                            "Transactional pipeline execution cannot guarantee dual-connection atomicity across destination connection '{$destConnection}' and tracking connection '{$trackingConnection}'. Either configure both to use the same connection, or call ->allowCrossConnectionTransactions() to explicitly proceed with nested commits."
-                        );
-                    }
-
-                    DB::connection($trackingConnection)->transaction(function () use ($destConnection, $execute) {
-                        DB::connection($destConnection)->transaction(function () use ($execute) {
-                            $execute();
-                        });
-                    });
-                } else {
-                    $conn = $destConnection ?? $trackingConnection;
-                    DB::connection($conn)->transaction($execute);
-                }
-            } else {
-                $execute();
+            PipelineChunkCompleted::dispatch($this->runId, $chunk->sequence(), $chunk->count(), $result->successful, $result->failed(), round(microtime(true) - $started, 4));
+            if ($this->progressCallback !== null) {
+                ($this->progressCallback)($totalProcessed, $this->source->count(), $result->successful, $result->failed(), $result->chunk);
             }
-        } catch (Throwable $e) {
-            foreach ($stages ?? $this->stages as $stage) {
-                if ($stage instanceof DeduplicateStage) {
-                    $stage->rollbackClaims();
-                }
-            }
-
-            throw $e;
+        } catch (Throwable $listenerException) {
+            report($listenerException);
         }
     }
 
@@ -1395,22 +1055,7 @@ class DataPipeline
      */
     private function executeStagesOnChunk(RecordChunk $chunk, ?array $stages = null): RecordChunk
     {
-        $stages = $stages ?? $this->stages;
-
-        // Execute stages preserving exact fluent registration order
-        foreach ($stages as $stage) {
-            if ($stage instanceof RecordStageInterface) {
-                foreach ($chunk->records() as $record) {
-                    if (! $record->isDropped()) {
-                        $stage->handleRecord($record);
-                    }
-                }
-            } elseif ($stage instanceof ChunkStageInterface) {
-                $chunk = $stage->handleChunk($chunk);
-            }
-        }
-
-        return $chunk;
+        return app(ChunkExecutor::class)->processStages($chunk, $stages ?? $this->stages);
     }
 
     private function resolveSource(mixed $source): SourceInterface

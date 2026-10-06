@@ -1,19 +1,14 @@
 <?php
 
-namespace Tests\Feature;
+namespace Robel\DataPipeline\Tests\Feature;
 
-// use Illuminate\Foundation\Testing\RefreshDatabase;
-use Tests\TestCase;
+use Robel\DataPipeline\PipelineManager;
+use Robel\DataPipeline\Tests\TestCase;
 
 class ExampleTest extends TestCase
 {
-    /**
-     * A basic test example.
-     */
-    public function test_the_application_returns_a_successful_response(): void
+    public function test_provider_registers_the_package_manager(): void
     {
-        $response = $this->get('/');
-
-        $response->assertStatus(200);
+        $this->assertInstanceOf(PipelineManager::class, $this->app->make('data-pipeline'));
     }
 }

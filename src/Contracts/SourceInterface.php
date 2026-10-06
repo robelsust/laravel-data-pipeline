@@ -10,7 +10,7 @@ interface SourceInterface
      * Return an iterable stream of raw records.
      * Must maintain an O(1) memory profile regardless of dataset size.
      *
-     * @return iterable<int|string, array<string, mixed>>
+     * @return iterable<int|string, array<int|string, mixed>>
      */
     public function records(): iterable;
 

@@ -26,7 +26,8 @@ final class PipelineStressTestCommand extends Command
         {--records=500000 : Total records for the test}
         {--chunk-size=5000 : Records per chunk}
         {--keep-csv : Keep the generated CSV files}
-        {--table=users : Destination MySQL table}';
+        {--table=pipeline_benchmark_records : Destination table}
+        {--allow-destructive : Explicitly permit truncating a custom table}';
 
     /**
      * The console command description.
@@ -36,10 +37,18 @@ final class PipelineStressTestCommand extends Command
     public function handle(PipelineRepositoryInterface $repository): int
     {
         $scenario = strtolower((string) $this->argument('scenario'));
+        if (! in_array($scenario, ['poison-pill', 'b', 'crash-resume', 'c', 'all'], true)) {
+            $this->error('Unknown stress-test scenario.');
+
+            return self::FAILURE;
+        }
         $records = max(100, (int) $this->option('records'));
         $chunkSize = max(10, (int) $this->option('chunk-size'));
-        $table = (string) ($this->option('table') ?: 'users');
+        $table = (string) ($this->option('table') ?: BenchmarkTable::Name);
         $keepCsv = (bool) $this->option('keep-csv');
+        if (! BenchmarkTable::prepare($this, $table, true)) {
+            return self::FAILURE;
+        }
 
         $this->info('================================================================');
         $this->info('  Laravel Data Pipeline - Production Readiness Stress Suite');
@@ -282,8 +291,8 @@ final class PipelineStressTestCommand extends Command
         $defName = 'CrashResumeStressTest';
 
         // 3. Register definition with crash injection at midpoint
-        $shouldCrash = true;
-        DataPipeline::register($defName, function () use ($csvPath, $chunkSize, $table, $defName, &$shouldCrash, $crashAtChunk) {
+        $crashState = (object) ['enabled' => true];
+        DataPipeline::register($defName, function () use ($csvPath, $chunkSize, $table, $defName, $crashState, $crashAtChunk) {
             $pipeline = DataPipeline::from($csvPath)
                 ->name($defName)
                 ->as($defName)
@@ -299,21 +308,19 @@ final class PipelineStressTestCommand extends Command
                 ->track(true)
                 ->insert($table);
 
-            if ($shouldCrash) {
-                $pipeline->pipe(new class($crashAtChunk) implements ChunkStageInterface
+            $pipeline->pipe(new class($crashAtChunk, $crashState) implements ChunkStageInterface
+            {
+                public function __construct(private int $crashChunk, private \stdClass $state) {}
+
+                public function handleChunk(RecordChunk $chunk): RecordChunk
                 {
-                    public function __construct(private int $crashChunk) {}
-
-                    public function handleChunk(RecordChunk $chunk): RecordChunk
-                    {
-                        if ($chunk->sequence() > $this->crashChunk) {
-                            throw new RuntimeException("Simulated catastrophic crash at chunk sequence {$chunk->sequence()}!");
-                        }
-
-                        return $chunk;
+                    if ($this->state->enabled && $chunk->sequence() > $this->crashChunk) {
+                        throw new RuntimeException("Simulated catastrophic crash at chunk sequence {$chunk->sequence()}!");
                     }
-                });
-            }
+
+                    return $chunk;
+                }
+            });
 
             return $pipeline;
         });
@@ -351,7 +358,7 @@ final class PipelineStressTestCommand extends Command
         // 6. Resume the run from last checkpoint (disabling crash trigger)
         $this->newLine();
         $this->info("Resuming Pipeline [{$runId}] from last checkpoint (skipping chunks 1..{$crashAtChunk})...");
-        $shouldCrash = false; // System recovered, crash condition cleared
+        $crashState->enabled = false; // System recovered, crash condition cleared
 
         $resumeStart = microtime(true);
         $resumePipeline = DataPipeline::resolveDefinition($defName);

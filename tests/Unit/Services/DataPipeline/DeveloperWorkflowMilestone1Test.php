@@ -2,9 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Tests\Unit\Services\DataPipeline;
+namespace Robel\DataPipeline\Tests\Unit\Services\DataPipeline;
 
-use App\Models\User;
+use Generator;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Validation\Rule;
+use InvalidArgumentException;
+use LogicException;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Events\PipelineFailed;
 use Robel\DataPipeline\Exceptions\PipelineValidationException;
@@ -12,12 +17,7 @@ use Robel\DataPipeline\Models\PipelineRun;
 use Robel\DataPipeline\Sinks\InsertSink;
 use Robel\DataPipeline\Sinks\ModelSink;
 use Robel\DataPipeline\Sources\ArraySource;
-use Generator;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Event;
-use Illuminate\Validation\Rule;
-use InvalidArgumentException;
-use LogicException;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

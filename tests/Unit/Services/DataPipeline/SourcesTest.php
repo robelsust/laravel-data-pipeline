@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\LazyCollection;
 use Robel\DataPipeline\Sources\ArraySource;
 use Robel\DataPipeline\Sources\CsvSource;
 use Robel\DataPipeline\Sources\LazySource;
-use Illuminate\Support\LazyCollection;
 
 it('iterates through ArraySource correctly', function () {
     $data = [

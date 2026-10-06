@@ -1,6 +1,6 @@
 <?php
 
-namespace Tests\Unit;
+namespace Robel\DataPipeline\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
 

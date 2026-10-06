@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\RecordContext;
 use Robel\DataPipeline\Sinks\CustomSink;
 use Robel\DataPipeline\Sinks\InsertSink;
 use Robel\DataPipeline\Sinks\UpsertSink;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

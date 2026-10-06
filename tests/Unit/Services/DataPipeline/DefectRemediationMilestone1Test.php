@@ -2,9 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Tests\Unit\Services\DataPipeline;
+namespace Robel\DataPipeline\Tests\Unit\Services\DataPipeline;
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
+use LogicException;
 use Robel\DataPipeline\Contracts\SinkInterface;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Exceptions\PipelineValidationException;
@@ -18,9 +20,7 @@ use Robel\DataPipeline\Repositories\PipelineRepositoryInterface;
 use Robel\DataPipeline\Results\SinkResult;
 use Robel\DataPipeline\Sinks\ModelSink;
 use Robel\DataPipeline\Stages\DeduplicateStage;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Artisan;
-use LogicException;
+use Robel\DataPipeline\Tests\Fixtures\User;
 use RuntimeException;
 
 uses(RefreshDatabase::class);

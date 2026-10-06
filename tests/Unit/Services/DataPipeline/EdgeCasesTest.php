@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\RecordContext;
 use Robel\DataPipeline\Stages\DeduplicateStage;
 use Robel\DataPipeline\Stages\ResolveRelationStage;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Cache;
 
 uses(RefreshDatabase::class);
 
@@ -58,6 +58,7 @@ it('supports distributed deduplication across worker processes using cache store
     $rec1 = RecordContext::fromRaw(['email' => 'worker@test.com'], 1);
     $worker1Stage->handleRecord($rec1);
     expect($rec1->isDropped())->toBeFalse();
+    $worker1Stage->commitClaims();
 
     // Stage in Worker 2 (completely new instance in separate memory)
     $worker2Stage = new DeduplicateStage('email', action: 'drop', store: 'array', scope: 'pipeline:test:');

@@ -7,6 +7,7 @@ namespace Robel\DataPipeline\Sinks;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Robel\DataPipeline\Contracts\SinkInterface;
+use Robel\DataPipeline\Exceptions\PersistenceError;
 use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\Results\SinkResult;
 use Throwable;
@@ -106,7 +107,7 @@ final readonly class UpsertSink implements SinkInterface
 
         // If update columns not specified, default to all non-unique columns from first record
         $updateColumns = $this->update;
-        if ($updateColumns === null && ! empty($payloads)) {
+        if ($updateColumns === null) {
             $allColumns = array_keys($payloads[0]);
             $updateColumns = array_values(array_diff($allColumns, $this->uniqueBy));
         }
@@ -116,15 +117,15 @@ final readonly class UpsertSink implements SinkInterface
                 ? DB::connection($this->connection)->table($this->table)
                 : DB::table($this->table);
 
-            $query->upsert($payloads, $this->uniqueBy, $updateColumns);
+            $query->getConnection()->transaction(fn (): int => $query->upsert($payloads, $this->uniqueBy, $updateColumns));
 
             return SinkResult::success(count($payloads));
         } catch (Throwable $e) {
             foreach ($chunk->valid() as $record) {
-                $record->addError('_db', $e->getMessage());
+                $record->addError('_db', PersistenceError::describe($e));
             }
 
-            return SinkResult::failure(count($payloads), ['exception' => $e->getMessage()]);
+            return SinkResult::failure(count($payloads), ['exception' => PersistenceError::describe($e)]);
         }
     }
 }

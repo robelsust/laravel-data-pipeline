@@ -21,7 +21,8 @@ final class PipelineBenchmarkCommand extends Command
         {--file= : Custom CSV file path}
         {--keep-csv : Keep the generated CSV file after benchmark completion}
         {--track : Track pipeline checkpoints and run history in MySQL}
-        {--table=users : Destination MySQL table}
+        {--table=pipeline_benchmark_records : Destination table}
+        {--allow-destructive : Explicitly permit truncating a custom table}
         {--truncate : Truncate destination table before running}
         {--upsert : Use UpsertSink instead of InsertSink for collision/merge testing}
         {--unique-by=email : Comma-separated unique columns for upsert resolution}
@@ -39,12 +40,15 @@ final class PipelineBenchmarkCommand extends Command
         $newRecords = $records - $copiedRecords;
 
         $chunkSize = max(1, (int) $this->option('chunk-size'));
-        $table = (string) ($this->option('table') ?: 'users');
+        $table = (string) ($this->option('table') ?: BenchmarkTable::Name);
         $track = (bool) $this->option('track');
         $truncate = (bool) $this->option('truncate');
         $keepCsv = (bool) $this->option('keep-csv');
         $skipGenerate = (bool) $this->option('skip-generate');
         $upsert = (bool) $this->option('upsert');
+        if (! BenchmarkTable::prepare($this, $table, $truncate)) {
+            return self::FAILURE;
+        }
         $uniqueByStr = (string) ($this->option('unique-by') ?: 'email');
         $uniqueCols = array_map('trim', explode(',', $uniqueByStr));
 

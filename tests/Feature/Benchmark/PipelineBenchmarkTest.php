@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
-use Robel\DataPipeline\DataPipeline;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
+use Robel\DataPipeline\DataPipeline;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

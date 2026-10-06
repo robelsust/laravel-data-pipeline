@@ -29,6 +29,7 @@ final readonly class CsvSource implements SourceInterface
         }
     }
 
+    /** @return \Generator<int, array<int|string, mixed>> */
     public function records(): iterable
     {
         $handle = fopen($this->filePath, 'r');

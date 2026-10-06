@@ -11,10 +11,15 @@ return new class extends Migration
     /**
      * Run the migrations.
      */
+    public function getConnection(): ?string
+    {
+        return config('data-pipeline.connection');
+    }
+
     public function up(): void
     {
         // 1. pipeline_runs
-        Schema::create('pipeline_runs', function (Blueprint $table) {
+        Schema::connection($this->getConnection())->create('pipeline_runs', function (Blueprint $table) {
             $table->uuid('id')->primary();
             $table->string('name')->nullable();
             $table->string('status', 32)->index(); // CREATED, RUNNING, COMPLETED, PARTIAL_SUCCESS, FAILED, PAUSED
@@ -31,7 +36,7 @@ return new class extends Migration
         });
 
         // 2. pipeline_chunks
-        Schema::create('pipeline_chunks', function (Blueprint $table) {
+        Schema::connection($this->getConnection())->create('pipeline_chunks', function (Blueprint $table) {
             $table->bigIncrements('id');
             $table->uuid('pipeline_id')->index();
             $table->unsignedInteger('sequence');
@@ -49,7 +54,7 @@ return new class extends Migration
         });
 
         // 3. pipeline_errors (Quarantine table)
-        Schema::create('pipeline_errors', function (Blueprint $table) {
+        Schema::connection($this->getConnection())->create('pipeline_errors', function (Blueprint $table) {
             $table->bigIncrements('id');
             $table->uuid('pipeline_id')->index();
             $table->unsignedBigInteger('chunk_id')->nullable()->index();
@@ -69,8 +74,8 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('pipeline_errors');
-        Schema::dropIfExists('pipeline_chunks');
-        Schema::dropIfExists('pipeline_runs');
+        Schema::connection($this->getConnection())->dropIfExists('pipeline_errors');
+        Schema::connection($this->getConnection())->dropIfExists('pipeline_chunks');
+        Schema::connection($this->getConnection())->dropIfExists('pipeline_runs');
     }
 };

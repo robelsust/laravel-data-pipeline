@@ -7,6 +7,7 @@ namespace Robel\DataPipeline\Sinks;
 use Illuminate\Database\Eloquent\Model;
 use InvalidArgumentException;
 use Robel\DataPipeline\Contracts\SinkInterface;
+use Robel\DataPipeline\Exceptions\PersistenceError;
 use Robel\DataPipeline\RecordChunk;
 use Robel\DataPipeline\Results\SinkResult;
 use Throwable;
@@ -57,8 +58,11 @@ final readonly class ModelSink implements SinkInterface
                     $model->setConnection($this->connection);
                 }
 
-                $model->fill($record->data());
-                $saved = $model->save();
+                $saved = $model->getConnection()->transaction(function () use ($model, $record): bool {
+                    $model->fill($record->data());
+
+                    return $model->save();
+                });
 
                 if ($saved) {
                     $persisted++;
@@ -71,7 +75,7 @@ final readonly class ModelSink implements SinkInterface
             } catch (Throwable $e) {
                 $failed++;
                 $failedIndices[] = $record->index();
-                $record->addError('_model', $e->getMessage());
+                $record->addError('_model', PersistenceError::describe($e));
             }
         }
 

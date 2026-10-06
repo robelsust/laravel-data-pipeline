@@ -2,7 +2,8 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Event;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Events\PipelineChunkCompleted;
 use Robel\DataPipeline\Events\PipelineCompleted;
@@ -10,8 +11,7 @@ use Robel\DataPipeline\Events\PipelineFailed;
 use Robel\DataPipeline\Events\PipelineRecordFailed;
 use Robel\DataPipeline\Events\PipelineStarted;
 use Robel\DataPipeline\Exceptions\PipelineValidationException;
-use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Support\Facades\Event;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 

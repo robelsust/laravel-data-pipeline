@@ -52,10 +52,14 @@ return [
     | across background queue workers using `DataPipeline::queue()`.
     |
     */
+    'deduplication' => ['pending_ttl' => 120, 'committed_ttl' => 86400],
+
     'queue' => [
         'connection' => env('DATA_PIPELINE_QUEUE_CONNECTION', null),
         'name' => env('DATA_PIPELINE_QUEUE_NAME', 'default'),
-        'max_retries' => env('DATA_PIPELINE_QUEUE_RETRIES', 3),
-        'timeout' => env('DATA_PIPELINE_QUEUE_TIMEOUT', 300),
+        'max_retries' => env('DATA_PIPELINE_QUEUE_RETRIES', 30),
+        'lease_seconds' => 90,
+        'release_delay' => 5,
+        'timeout' => env('DATA_PIPELINE_QUEUE_TIMEOUT', 60),
     ],
 ];

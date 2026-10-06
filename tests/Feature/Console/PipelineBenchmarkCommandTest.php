@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\Models\PipelineChunk;
 use Robel\DataPipeline\Models\PipelineRun;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Robel\DataPipeline\Tests\Fixtures\User;
 
 uses(RefreshDatabase::class);
 
@@ -13,6 +13,8 @@ it('executes pipeline:benchmark command and verifies persistence and cleanup', f
     $tempCsv = storage_path('app/test_cmd_benchmark.csv');
 
     $this->artisan('pipeline:benchmark', [
+        '--table' => 'users',
+        '--allow-destructive' => true,
         '--records' => 100,
         '--chunk-size' => 25,
         '--file' => $tempCsv,
@@ -32,6 +34,8 @@ it('executes pipeline:benchmark with --track and persists checkpoints', function
     $tempCsv = storage_path('app/test_cmd_benchmark_track.csv');
 
     $this->artisan('pipeline:benchmark', [
+        '--table' => 'users',
+        '--allow-destructive' => true,
         '--records' => 60,
         '--chunk-size' => 20,
         '--file' => $tempCsv,
@@ -70,6 +74,8 @@ it('executes pipeline:benchmark with --copied-records and --upsert', function ()
     $tempCsv = storage_path('app/test_cmd_benchmark_upsert.csv');
 
     $this->artisan('pipeline:benchmark', [
+        '--table' => 'users',
+        '--allow-destructive' => true,
         '--records' => 5,
         '--copied-records' => 2,
         '--chunk-size' => 2,

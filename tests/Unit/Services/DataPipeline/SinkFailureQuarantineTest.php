@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
+use Illuminate\Foundation\Testing\RefreshDatabase;
 use Robel\DataPipeline\DataPipeline;
 use Robel\DataPipeline\Models\PipelineError;
 use Robel\DataPipeline\Queue\ProcessPipelineChunkJob;
 use Robel\DataPipeline\Repositories\PipelineRepositoryInterface;
 use Robel\DataPipeline\Results\SinkResult;
 use Robel\DataPipeline\Sinks\CustomSink;
-use Illuminate\Foundation\Testing\RefreshDatabase;
 
 uses(RefreshDatabase::class);
 
