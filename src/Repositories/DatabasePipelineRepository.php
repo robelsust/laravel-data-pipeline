@@ -1,0 +1,280 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Robel\DataPipeline\Repositories;
+
+use Illuminate\Support\Facades\DB;
+use Robel\DataPipeline\Models\PipelineChunk;
+use Robel\DataPipeline\Models\PipelineError;
+use Robel\DataPipeline\Models\PipelineRun;
+
+final class DatabasePipelineRepository implements PipelineRepositoryInterface
+{
+    public function createRun(
+        string $sourceType,
+        ?int $totalRecords = null,
+        ?string $fingerprint = null,
+        ?string $name = null,
+        array $metadata = [],
+    ): PipelineRun {
+        return PipelineRun::create([
+            'name' => $name,
+            'status' => 'CREATED',
+            'source_type' => $sourceType,
+            'source_fingerprint' => $fingerprint,
+            'total_records' => $totalRecords,
+            'metadata' => $metadata,
+            'started_at' => now(),
+        ]);
+    }
+
+    public function updateRunProgress(
+        string $runId,
+        int $processedIncrement,
+        int $successfulIncrement,
+        int $failedIncrement
+    ): void {
+        DB::table('pipeline_runs')
+            ->where('id', $runId)
+            ->update([
+                'status' => 'RUNNING',
+                'processed_records' => DB::raw("processed_records + {$processedIncrement}"),
+                'successful_records' => DB::raw("successful_records + {$successfulIncrement}"),
+                'failed_records' => DB::raw("failed_records + {$failedIncrement}"),
+                'updated_at' => now(),
+            ]);
+    }
+
+    public function markRunCompleted(string $runId, string $status = 'COMPLETED'): void
+    {
+        DB::table('pipeline_runs')
+            ->where('id', $runId)
+            ->update([
+                'status' => $status,
+                'completed_at' => now(),
+                'updated_at' => now(),
+            ]);
+    }
+
+    public function markRunFailed(string $runId, string $errorMessage): void
+    {
+        $run = PipelineRun::find($runId);
+        $metadata = $run?->metadata ?? [];
+        $metadata['last_error'] = $errorMessage;
+
+        DB::table('pipeline_runs')
+            ->where('id', $runId)
+            ->update([
+                'status' => 'FAILED',
+                'metadata' => json_encode($metadata),
+                'completed_at' => now(),
+                'updated_at' => now(),
+            ]);
+    }
+
+    public function recordChunk(
+        string $runId,
+        int $sequence,
+        string $status,
+        int $recordsCount,
+        int $successfulCount,
+        int $failedCount,
+        ?int $lastOffset = null,
+        ?string $lastIdentifier = null,
+    ): PipelineChunk {
+        return PipelineChunk::updateOrCreate(
+            ['pipeline_id' => $runId, 'sequence' => $sequence],
+            [
+                'status' => $status,
+                'records_count' => $recordsCount,
+                'successful_count' => $successfulCount,
+                'failed_count' => $failedCount,
+                'last_record_offset' => $lastOffset,
+                'last_record_identifier' => $lastIdentifier,
+                'completed_at' => now(),
+            ]
+        );
+    }
+
+    public function quarantineErrors(
+        string $runId,
+        ?int $chunkId,
+        array $failures,
+        array $redactedAttributes = [],
+    ): void {
+        if ($chunkId !== null) {
+            $this->reconcileChunkErrors($runId, $chunkId, $failures, $redactedAttributes);
+
+            return;
+        }
+
+        if (empty($failures)) {
+            return;
+        }
+
+        $records = [];
+        $now = now()->toDateTimeString();
+
+        foreach ($failures as $failure) {
+            $raw = $failure->rawInput();
+
+            // Redact sensitive attributes if requested
+            if (! empty($redactedAttributes)) {
+                foreach ($redactedAttributes as $redactField) {
+                    if (array_key_exists($redactField, $raw)) {
+                        $raw[$redactField] = '[REDACTED]';
+                    }
+                }
+            }
+
+            $records[] = [
+                'pipeline_id' => $runId,
+                'chunk_id' => $chunkId,
+                'record_index' => is_numeric($failure->index()) ? (int) $failure->index() : 0,
+                'record_identifier' => $failure->identifier(),
+                'raw_payload' => json_encode($raw),
+                'validation_errors' => json_encode($failure->errors()),
+                'exception_message' => $failure->exception(),
+                'failed_at' => $now,
+            ];
+        }
+
+        DB::table('pipeline_errors')->insert($records);
+    }
+
+    public function reconcileChunkErrors(
+        string $runId,
+        int $chunkId,
+        array $failures,
+        array $redactedAttributes = [],
+    ): void {
+        $existingErrors = DB::table('pipeline_errors')
+            ->where('pipeline_id', $runId)
+            ->where('chunk_id', $chunkId)
+            ->get();
+
+        $currentFailuresByKey = [];
+        $currentFailuresByIndex = [];
+        foreach ($failures as $failure) {
+            $idx = is_numeric($failure->index()) ? (int) $failure->index() : 0;
+            $currentFailuresByIndex[$idx] = $failure;
+            if ($failure->identifier() !== null && $failure->identifier() !== '') {
+                $currentFailuresByKey['id:'.$failure->identifier()] = $failure;
+            }
+            $currentFailuresByKey['idx:'.$idx] = $failure;
+        }
+
+        $preservedExistingIds = [];
+
+        foreach ($existingErrors as $existing) {
+            $isStillFailing = false;
+            $matchedFailure = null;
+
+            if ($existing->record_identifier !== null && isset($currentFailuresByKey['id:'.$existing->record_identifier])) {
+                $isStillFailing = true;
+                $matchedFailure = $currentFailuresByKey['id:'.$existing->record_identifier];
+            } elseif (isset($currentFailuresByIndex[(int) $existing->record_index])) {
+                $isStillFailing = true;
+                $matchedFailure = $currentFailuresByIndex[(int) $existing->record_index];
+            }
+
+            if ($isStillFailing) {
+                $preservedExistingIds[] = $existing->id;
+
+                $updateData = [];
+                if ($matchedFailure !== null) {
+                    $raw = $matchedFailure->rawInput();
+                    if (! empty($redactedAttributes)) {
+                        foreach ($redactedAttributes as $redactField) {
+                            if (array_key_exists($redactField, $raw)) {
+                                $raw[$redactField] = '[REDACTED]';
+                            }
+                        }
+                    }
+                    $updateData['raw_payload'] = json_encode($raw);
+                    $updateData['validation_errors'] = json_encode($matchedFailure->errors());
+                    if ($matchedFailure->exception() !== null) {
+                        $updateData['exception_message'] = $matchedFailure->exception();
+                    }
+                }
+                if (! empty($updateData)) {
+                    DB::table('pipeline_errors')
+                        ->where('id', $existing->id)
+                        ->update($updateData);
+                }
+            } else {
+                DB::table('pipeline_errors')
+                    ->where('id', $existing->id)
+                    ->delete();
+            }
+        }
+
+        $newRecords = [];
+        $now = now()->toDateTimeString();
+
+        foreach ($failures as $failure) {
+            $idx = is_numeric($failure->index()) ? (int) $failure->index() : 0;
+            $ident = $failure->identifier();
+
+            $alreadyPreserved = false;
+            foreach ($existingErrors as $existing) {
+                if (in_array($existing->id, $preservedExistingIds, true)) {
+                    if ($ident !== null && $existing->record_identifier === $ident) {
+                        $alreadyPreserved = true;
+                        break;
+                    }
+                    if ((int) $existing->record_index === $idx) {
+                        $alreadyPreserved = true;
+                        break;
+                    }
+                }
+            }
+
+            if (! $alreadyPreserved) {
+                $raw = $failure->rawInput();
+                if (! empty($redactedAttributes)) {
+                    foreach ($redactedAttributes as $redactField) {
+                        if (array_key_exists($redactField, $raw)) {
+                            $raw[$redactField] = '[REDACTED]';
+                        }
+                    }
+                }
+
+                $newRecords[] = [
+                    'pipeline_id' => $runId,
+                    'chunk_id' => $chunkId,
+                    'record_index' => $idx,
+                    'record_identifier' => $ident,
+                    'raw_payload' => json_encode($raw),
+                    'validation_errors' => json_encode($failure->errors()),
+                    'exception_message' => $failure->exception(),
+                    'failed_at' => $now,
+                ];
+            }
+        }
+
+        if (! empty($newRecords)) {
+            DB::table('pipeline_errors')->insert($newRecords);
+        }
+    }
+
+    public function findRun(string $runId): ?PipelineRun
+    {
+        return PipelineRun::with(['chunks', 'errors'])->find($runId);
+    }
+
+    public function getQuarantinedRecords(string $runId): array
+    {
+        $errors = PipelineError::where('pipeline_id', $runId)
+            ->orderBy('record_index')
+            ->get();
+
+        $rows = [];
+        foreach ($errors as $err) {
+            $rows[$err->record_index] = $err->raw_payload;
+        }
+
+        return $rows;
+    }
+}
